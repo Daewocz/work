@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mapa obcí ČR – opravená</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; background: #0f172a; color: #e2e8f0; }
+    
+    #controls {
+      background: #1e293b;
+      padding: 12px 16px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      z-index: 1000;
+    }
+    
+    #controls input {
+      padding: 9px 14px;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: #0f172a;
+      color: #f1f5f9;
+      font-size: 14px;
+      min-width: 240px;
+    }
+    
+    #controls button {
+      padding: 9px 16px;
+      border: none;
+      border-radius: 8px;
+      background: #3b82f6;
+      color: white;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    #controls button:hover { background: #2563eb; }
+    #controls button:disabled { background: #475569; cursor: not-allowed; }
+    #controls button.secondary { background: #475569; }
+    
+    #status { font-size: 13px; color: #94a3b8; margin-left: auto; }
+    
+    #map { flex: 1; width: 100%; }
+    
+    .info-box {
+      position: absolute;
+      bottom: 24px;
+      left: 24px;
+      z-index: 1000;
+      background: rgba(30, 41, 59, 0.95);
+      color: #f1f5f9;
+      padding: 10px 16px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 500;
+      display: none;
+      border: 1px solid #334155;
+    }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <input type="text" id="search" placeholder="Vyhledat obec…">
+    <button id="btnSearch">Hledat</button>
+    <button id="btnLoad">Načíst hranice obcí v aktuálním výřezu</button>
+    <button id="btnClear" class="secondary">Vymazat</button>
+    <span id="status">Přibližte mapu (zoom ≥ 10) a načtěte hranice</span>
+  </div>
+  
+  <div id="map"></div>
+  <div class="info-box" id="infoBox"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- osmtogeojson – správný převod OSM → GeoJSON -->
+  <script src="https://unpkg.com/osmtogeojson@3.0.0-beta.5/osmtogeojson.js"></script>
+
+  <script>
+    const map = L.map('map').setView([49.82, 15.48], 7);
+
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles © Esri | Data: OpenStreetMap / RÚIAN',
+      maxZoom: 19
+    }).addTo(map);
+
+    let obceLayer = null;
+    const statusEl = document.getElementById('status');
+    const infoBox = document.getElementById('infoBox');
+    const btnLoad = document.getElementById('btnLoad');
+
+    function randomColor() {
+      const h = Math.floor(Math.random() * 360);
+      return `hsla(${h}, 70%, 55%, 0.5)`;
+    }
+
+    function styleFeature() {
+      return {
+        fillColor: randomColor(),
+        weight: 1.5,
+        opacity: 1,
+        color: '#1e293b',
+        fillOpacity: 0.55
+      };
+    }
+
+    function getName(feature) {
+      const p = feature.properties || {};
+      return p.name || p['name:cs'] || p.official_name || 'Obec';
+    }
+
+    function onEachFeature(feature, layer) {
+      const name = getName(feature);
+
+      layer.on({
+        mouseover: (e) => {
+          e.target.setStyle({ weight: 3, color: '#ef4444', fillOpacity: 0.8 });
+          e.target.bringToFront();
+          infoBox.style.display = 'block';
+          infoBox.innerHTML = name;
+        },
+        mouseout: (e) => {
+          obceLayer.resetStyle(e.target);
+          infoBox.style.display = 'none';
+        },
+        click: () => {
+          layer.bindPopup(`<strong>${name}</strong>`).openPopup();
+        }
+      });
+
+      layer.bindTooltip(name, { permanent: false, direction: 'center' });
+    }
+
+    async function loadObceInBounds() {
+      const bounds = map.getBounds();
+      const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+
+      if (map.getZoom() < 10) {
+        statusEl.textContent = 'Přibližte mapu alespoň na zoom 10';
+        return;
+      }
+
+      btnLoad.disabled = true;
+      statusEl.textContent = 'Načítám data z Overpass…';
+
+      const query = `
+        [out:json][timeout:90];
+        (
+          relation["boundary"="administrative"]["admin_level"="8"](${bbox});
+        );
+        out body;
+        >;
+        out skel qt;
+      `;
+
+      const endpoints = [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter'
+      ];
+
+      let data = null;
+
+      for (const url of endpoints) {
+        try {
+          statusEl.textContent = `Zkouším ${url.split('/')[2]}…`;
+          const res = await fetch(url, {
+            method: 'POST',
+            body: 'data=' + encodeURIComponent(query),
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+          });
+
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          data = await res.json();
+          break;
+        } catch (e) {
+          console.warn(e);
+        }
+      }
+
+      if (!data) {
+        statusEl.textContent = 'Nepodařilo se stáhnout data. Spusťte stránku přes localhost.';
+        btnLoad.disabled = false;
+        return;
+      }
+
+      try {
+        // osmtogeojson správně poskládá polygony
+        const geojson = osmtogeojson(data, {
+          flatProperties: true
+        });
+
+        // filtrujeme jen polygony/multipolygony
+        geojson.features = geojson.features.filter(f => 
+          f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon')
+        );
+
+        if (geojson.features.length === 0) {
+          statusEl.textContent = 'Žádné polygony v tomto výřezu';
+          btnLoad.disabled = false;
+          return;
+        }
+
+        if (obceLayer) map.removeLayer(obceLayer);
+
+        obceLayer = L.geoJSON(geojson, {
+          style: styleFeature,
+          onEachFeature: onEachFeature
+        }).addTo(map);
+
+        statusEl.textContent = `Načteno ${geojson.features.length} obcí`;
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'Chyba při převodu dat: ' + err.message;
+      }
+
+      btnLoad.disabled = false;
+    }
+
+    document.getElementById('btnLoad').addEventListener('click', loadObceInBounds);
+    document.getElementById('btnClear').addEventListener('click', () => {
+      if (obceLayer) {
+        map.removeLayer(obceLayer);
+        obceLayer = null;
+      }
+      statusEl.textContent = 'Hranice vymazány';
+      infoBox.style.display = 'none';
+    });
+
+    async function searchObec() {
+      const q = document.getElementById('search').value.trim();
+      if (!q) return;
+      statusEl.textContent = 'Hledám…';
+
+      try {
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q + ', Česko')}&limit=5&countrycodes=cz`);
+        const data = await res.json();
+        if (!data.length) {
+          statusEl.textContent = 'Nenalezeno';
+          return;
+        }
+        const p = data[0];
+        map.setView([p.lat, p.lon], 13);
+        L.marker([p.lat, p.lon]).addTo(map)
+          .bindPopup(`<strong>${p.display_name.split(',')[0]}</strong>`).openPopup();
+        statusEl.textContent = p.display_name.split(',')[0];
+      } catch (e) {
+        statusEl.textContent = 'Chyba vyhledávání';
+      }
+    }
+
+    document.getElementById('btnSearch').addEventListener('click', searchObec);
+    document.getElementById('search').addEventListener('keypress', e => {
+      if (e.key === 'Enter') searchObec();
+    });
+  </script>
+</body>
+</html>
